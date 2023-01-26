@@ -46,7 +46,9 @@ Usage and Example
                 [--max_peaks_used MAX_PEAKS_USED] [--scaling {off,root,log,rank}] [--hd_dim HD_DIM] [--hd_Q HD_Q] [--hd_id_flip_factor HD_ID_FLIP_FACTOR]
                 [--cluster_charges [CLUSTER_CHARGES ...]] 
                 [--precursor_tol PRECURSOR_TOL PRECURSOR_TOL] [--rt_tol RT_TOL] [--fragment_tol FRAGMENT_TOL] [--eps EPS]
+                [--cluster_alg {dbscan,hc_single,hc_complete,hc_average}]
                 [--refine REFINE]
+                [--checkpoint CHECKPOINT] [--representative_mgf]
                 input_filepath output_filename
 
     Positional arguments:
@@ -56,7 +58,7 @@ Usage and Example
     Optional arguments:
     -h, --help                  Show the help messages
     --cpu_core_preprocess       The number of CPU cores used for preprocessing. (default: 6)
-    --cpu_core_cluster          The number of CPU cores used for DBSCAN clustering. 
+    --cpu_core_cluster          The number of CPU cores used for clustering. 
                                 Only enable when `use_gpu_cluster` is True. (default: 6)
     --batch_size                The batch size for HD encoding on GPU. (default: 5000)
     --use_gpu_cluster           Flag that determines whether to use DBSCAN 
@@ -64,16 +66,39 @@ Usage and Example
     --hd_dim                    The HD dimension. (default: 2048)
     --hd_Q                      The HD quantization level. (default: 16)
     --cluster_charges           The charges to be clustered. (default: 2 3)
+    --cluster_alg               Select DBSCAN or hierarchical clustering algorithm (including dbscan, hc_single, hc_complete, and hc_average) for spectra (default: hc_complete) 
     --eps                       The threshold value `eps` for DBSCAN clustering. 
                                 (default: 0.4)
     --refine                    Flag to determine whether refine the clustering results.
+                                (default: True)
+    --representative_mgf        Flag to determine whether exporting the clustering representatives.
                                 (default: False)
+    --checkpoint                The checkpoint filename to save the encoded HVs of spectra (default: None)
 
-_HyperSpec_ supports running using the command line and takes `MGF` peak files as input and exports the clustering result as a CSV file with each MS/MS spectrum and its cluster label on a single line. Here is an example of running _HyperSpec_:
 
-    python src/main.py ~/dataset/ ./output.csv  --cpu_core_preprocess=4 --use_gpu_cluster --cluster_charges 2 3 --eps=0.4 --refine
+_HyperSpec_ supports running using the command line and takes `MGF` peak files as input and exports the clustering result as a CSV file with each MS/MS spectrum and its cluster label on a single line. Here we provide two examples of running _HyperSpec_:
 
-This will cluster all MS/MS spectra in folder `~/dataset/` on `GPU` and generate the `otput.csv` file. The number of CPU cores for preprocessing is `4`. Only `Charge 2` and `Charge 3` are clustered in this configuration. The DBSCAN clustering threshold is `eps=0.4` and post-clustering refinement is `enable`.
+### Example 1
+
+    python src/main.py ~/dataset/ ./output.csv  --cpu_core_preprocess=4 --cluster_alg dbscan --use_gpu_cluster --cluster_charges 2 3 --eps=0.2 --refine
+
+This will cluster all MS/MS spectra in folder `~/dataset/` on `GPU` and generate the `output.csv` file. The number of CPU cores for preprocessing is `4`. Only `Charge 2` and `Charge 3` are clustered in this configuration. The DBSCAN clustering threshold is `eps=0.2` and post-clustering refinement is `enable`.
+
+### Example 2
+
+    python src/main.py ~/dataset/ ./output.csv  --cpu_core_preprocess=4 --cluster_alg hc_complete --cluster_charges 2 3 --eps=0.25 --refine
+
+This will cluster all MS/MS spectra in folder `~/dataset/` using `hierarchical clustering with complete linkage` on `CPU` and generate the `output.csv` file. The number of CPU cores for preprocessing is `4`. Only `Charge 2` and `Charge 3` are clustered in this configuration. The hierarchical clustering threshold is `eps=0.25` and post-clustering refinement is `enable`.
+
+Exported results format
+------------------------------------------------------
+The exported meta data for clustering results are compressed and stored in `parquet` file, which records `bucket`, `precursor_charge`, `precursor_mz`, `identifier`, `scan`, `retention_time`, `cluster`, and `is_representative` information. The format is given as:
+
+|bucket|precursor_charge|precursor_mz|identifier|scan                              |retention_time|cluster   |is_representative|
+|------|----------------|------------|----------|----------------------------------|--------------|----------|-----------------|
+|598   |2               |300.148804  |Adult_Gallbladder_bRP_Elite_53_f07|338                               |165.133194    |664       |True             |
+|5384  |3               |1796.564697 |Fetal_Ovary_bRP_Velos_41_f18|4875                              |2896.885986   |4455302   |False            |
+
 
 How HyperSpec Works
 ------------------------------------------------------

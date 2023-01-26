@@ -1,8 +1,4 @@
-from distutils.log import error
-import time, logging
-import math
-from typing import Callable, Iterator, List, Optional, Tuple
-
+import os, time, logging, math
 from tqdm import tqdm
 
 import numpy as np
@@ -11,19 +7,20 @@ np.random.seed(0)
 import numba as nb
 from numba import cuda
 from numba.typed import List
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import cupy as cp
-import cuml
-import rmm
+import cuml, rmm
 rmm.reinitialize(pool_allocator=False, managed_memory=True)
 
 import pandas as pd
-
 import scipy.sparse as ss
+from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import fcluster
+import fastcluster
 from sklearn.cluster import DBSCAN
 
-import config
+from config import Config
 from joblib import Parallel, delayed
 
 
@@ -62,12 +59,20 @@ def gen_lv_id_hvs(
     D: int,
     Q: int,
     bin_len: int,
-    id_flip_factor: float
+    id_flip_factor: float,
+    logger: logging
 ):
-    lv_hvs = gen_lvs(D, Q)
-    lv_hvs = cuda_bit_packing(lv_hvs, Q+1, D)
-    id_hvs = gen_idhvs(D, bin_len, id_flip_factor)
-    id_hvs = cuda_bit_packing(id_hvs, bin_len, D)
+    lv_id_hvs_file = 'lv_id_hvs_D_{}_Q_{}_bin_{}_flip_{}.npz'.format(D, Q, bin_len, id_flip_factor)
+    if os.path.exists(lv_id_hvs_file):
+        logger.info("Load existing {} file for HD".format(lv_id_hvs_file))
+        data = cp.load(lv_id_hvs_file)
+        lv_hvs, id_hvs = data['lv_hvs'], data['id_hvs']
+    else:
+        lv_hvs = gen_lvs(D, Q)
+        lv_hvs = cuda_bit_packing(lv_hvs, Q+1, D)
+        id_hvs = gen_idhvs(D, bin_len, id_flip_factor)
+        id_hvs = cuda_bit_packing(id_hvs, bin_len, D)
+        cp.savez(lv_id_hvs_file, lv_hvs=lv_hvs, id_hvs=id_hvs)
     return lv_hvs, id_hvs
 
 
@@ -99,13 +104,13 @@ def cuda_bit_packing(orig_vecs, N, D):
     return packed_vecs.reshape(N, pack_len)
 
 
-def hd_encode_spectra_packed(csr_spectra, id_hvs_packed, lv_hvs_packed, N, D, Q, output_type):
+def hd_encode_spectra_packed(spectra_intensity, spectra_mz, id_hvs_packed, lv_hvs_packed, N, D, Q, output_type):
     packed_dim = (D + 32 - 1) // 32
     encoded_spectra = cp.zeros(N * packed_dim, dtype=cp.uint32)
     
-    spectra_data = cp.array(csr_spectra.data, dtype=cp.float32).ravel()
-    spectra_indices = cp.array(csr_spectra.indices, dtype=cp.int32).ravel()
-    spectra_indptr = cp.array(csr_spectra.indptr, dtype=cp.int32).ravel()
+    max_peaks_used = spectra_intensity.shape[1]
+    spectra_intensity = cp.array(spectra_intensity, dtype=cp.float32).ravel()
+    spectra_mz = cp.array(spectra_mz, dtype=cp.int32).ravel()
     
     hd_enc_lvid_packed_cuda_kernel = cp.RawKernel(r'''
                 __device__ float* get2df(float* p, const int x, int y, const int stride) {
@@ -120,10 +125,11 @@ def hd_encode_spectra_packed(csr_spectra, id_hvs_packed, lv_hvs_packed, N, D, Q,
                     }
                 }
                 extern "C" __global__
-                void hd_enc_lvid_packed_cuda(unsigned int* __restrict__ id_hvs_packed, unsigned int* __restrict__ level_hvs_packed, 
-                                            int* __restrict__ feature_indices, float* __restrict__ feature_values, 
-                                            int* __restrict__ csr_info, unsigned int* hv_matrix,
-                                            int N, int Q, int D, int packLength) {
+                void hd_enc_lvid_packed_cuda(
+                    unsigned int* __restrict__ id_hvs_packed, unsigned int* __restrict__ level_hvs_packed, 
+                    int* __restrict__ feature_indices, float* __restrict__ feature_values, 
+                    int max_peaks_used, unsigned int* hv_matrix, 
+                    int N, int Q, int D, int packLength) {
                     const int d = threadIdx.x + blockIdx.x * blockDim.x;
                     if (d >= D)
                         return;
@@ -131,14 +137,13 @@ def hd_encode_spectra_packed(csr_spectra, id_hvs_packed, lv_hvs_packed, N, D, Q,
                     {
                         // we traverse [start, end-1]
                         float encoded_hv_e = 0.0;
-                        unsigned int start_range = csr_info[sample_idx];
-                        unsigned int end_range = csr_info[sample_idx + 1];
+                        unsigned int start_range = sample_idx*max_peaks_used;
+                        unsigned int end_range = (sample_idx + 1)*max_peaks_used;
                         #pragma unroll 1
                         for (int f = start_range; f < end_range; ++f) {
-                            // encoded_hv_e += level_hvs[((int)(feature_values[f] * Q))*D+d] * id_hvs[feature_indices[f]*D+d];
-                            // encoded_hv_e += level_hvs[(int)(info.Intensity * Q) * D + d] * id_hvs[info.Idx * D + d];
-                            encoded_hv_e += get2d_bin(level_hvs_packed, (int)(feature_values[f] * Q), D, d) * \
-                                            get2d_bin(id_hvs_packed, feature_indices[f], D, d);
+                            if(feature_values[f] != -1)
+                                encoded_hv_e += get2d_bin(level_hvs_packed, (int)(feature_values[f] * Q), D, d) * \
+                                                get2d_bin(id_hvs_packed, feature_indices[f], D, d);
                         }
                         
                         // hv_matrix[sample_idx*D+d] = (encoded_hv_e > 0)? 1 : -1;
@@ -156,7 +161,9 @@ def hd_encode_spectra_packed(csr_spectra, id_hvs_packed, lv_hvs_packed, N, D, Q,
                 
     threads = 1024
     max_block = cp.cuda.runtime.getDeviceProperties(0)['maxGridSize'][1]
-    hd_enc_lvid_packed_cuda_kernel(((D + threads - 1) // threads, min(N, max_block)), (threads,), (id_hvs_packed, lv_hvs_packed, spectra_indices, spectra_data, spectra_indptr, encoded_spectra, N, Q, D, packed_dim))
+    hd_enc_lvid_packed_cuda_kernel(
+        ((D + threads - 1) // threads, min(N, max_block)), (threads,), 
+        (id_hvs_packed, lv_hvs_packed, spectra_mz, spectra_intensity, max_peaks_used, encoded_spectra, N, Q, D, packed_dim))
 
     if output_type=='numpy':
         return encoded_spectra.reshape(N, packed_dim).get()
@@ -206,7 +213,7 @@ def fast_pw_dist_cosine_mask_packed(A, D, prec_mz, prec_tol, N, pack_len):
             D[x,y] = 1.0
             D[y,x] = 1.0
         else:
-            tmp/=(16*pack_len)
+            tmp/=(32*pack_len)
             D[x,y] = tmp
             D[y,x] = tmp
 
@@ -215,7 +222,8 @@ def fast_nb_cosine_dist_mask(hvs, prec_mz, prec_tol, output_type, stream=None):
     N, pack_len = hvs.shape
 
     # start = time.time()
-
+    # ss = cp.cuda.Stream(non_blocking=True)
+    # with stream:
     hvs_d = cp.array(hvs)
     prec_mz_d = cp.array(prec_mz.ravel())
     prec_tol_d = nb.float32(prec_tol/1e6)
@@ -239,8 +247,72 @@ def fast_nb_cosine_dist_mask(hvs, prec_mz, prec_tol, output_type, stream=None):
         dist = dist_d
     else:
         dist = dist_d.get()
-    del dist_d
     # print("Data fetching time: ", time.time()-start)
+
+    return dist
+
+
+# Condense pw_dist computation function with improved performance
+@cuda.jit('void(uint32[:,:], float32[:], float32[:], float32, int32, int32)')
+def fast_pw_dist_cosine_mask_packed_condense(A, D, prec_mz, prec_tol, N, pack_len):
+    """
+        Pair-wise cosine distance
+    """
+    sA = cuda.shared.array((TPB, TPB1), dtype=nb.uint32)
+    sB = cuda.shared.array((TPB, TPB1), dtype=nb.uint32)
+
+    x, y = cuda.grid(2)
+    tx, ty = cuda.threadIdx.x, cuda.threadIdx.y
+    bx = cuda.blockIdx.x
+
+    tmp = nb.float32(.0)
+    for i in range((pack_len+TPB-1) // TPB):
+        if y < N and (i*TPB+tx) < pack_len:
+            sA[ty, tx] = A[y, i*TPB+tx]
+        else:
+            sA[ty, tx] = .0
+
+        if (TPB*bx+ty) < N and (i*TPB+tx) < pack_len:
+            sB[ty, tx] = A[TPB*bx+ty, i*TPB+tx]
+        else:
+            sB[ty, tx] = .0  
+        cuda.syncthreads()
+
+        for j in range(TPB):
+            tmp += fast_hamming_op(sA[ty, j], sB[tx, j])
+
+        cuda.syncthreads()
+
+    if x<N and y<N and y>x:
+        if cuda.libdevice.fabsf((prec_mz[x]-prec_mz[y])/prec_mz[y])>=prec_tol:
+            D[int(N*x-(x*x+x)/2+y-x-1)] = 1.0
+        else:
+            tmp/=(32*pack_len)
+            D[int(N*x-(x*x+x)/2+y-x-1)] = tmp
+           
+
+def fast_nb_cosine_dist_condense(hvs, prec_mz, prec_tol, output_type, stream=None):
+    N, pack_len = hvs.shape
+    
+    hvs_d = cp.array(hvs)
+    prec_mz_d = cp.array(prec_mz.ravel())
+    prec_tol_d = nb.float32(prec_tol/1e6)
+    dist_d = cp.zeros(int(N*(N-1)/2), dtype=cp.float32)
+
+    TPB = 32
+    threadsperblock = (TPB, TPB)
+    blockspergrid_x = math.ceil(N / threadsperblock[0])
+    blockspergrid_y = math.ceil(N / threadsperblock[1])
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+    fast_pw_dist_cosine_mask_packed_condense[blockspergrid, threadsperblock]\
+        (hvs_d, dist_d, prec_mz_d, prec_tol_d, N, pack_len)
+    cuda.synchronize()
+
+    if output_type=='cupy':
+        dist = dist_d
+    else:
+        dist = dist_d.get()
 
     return dist
 
@@ -274,94 +346,92 @@ def get_dim(min_mz: float, max_mz: float, bin_size: float) \
     return math.ceil((end_dim - start_dim) / bin_size), start_dim, end_dim
 
 
-# @nb.njit(cache=True)
+# @nb.jit(cache=True)
 def _to_csr_vector(
     spectra: pd.DataFrame, 
     min_mz: float, 
     bin_size: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
     mz = spectra['mz'].to_numpy()
     intensity = spectra['intensity'].to_numpy()
 
-    indptr = np.zeros(len(mz)+1, np.int32)
-    indptr[1:] = np.array([len(spec) for spec in mz], np.int32)
-    indptr = np.cumsum(indptr).ravel()
+    mz = np.floor((np.vstack(mz)-min_mz)/bin_size)
+    intensity = np.vstack(intensity)
 
-    indices = np.floor((np.hstack(mz).ravel()-min_mz)/bin_size)
-    data = np.hstack(intensity).ravel()
-    return data, indices, indptr
+    return intensity, mz 
 
 
-from multiprocessing import shared_memory
-class SharedMem:
-    """A simple example class"""
+def encode_cluster_spectra(
+    spectra_by_charge_df: pd.DataFrame,
+    config: Config,
+    logger: logging,
+    bin_len: int,
+    lv_hvs: cp.array,
+    id_hvs: cp.array
+):
+    # Encode spectra
+    logger.info("Start encoding")
+    encoded_spectra_hv = encode_preprocessed_spectra(
+            spectra_df=spectra_by_charge_df, 
+            config=config, dim=bin_len, logger=logger,
+            lv_hvs_packed=lv_hvs, id_hvs_packed=id_hvs,
+            output_type='numpy')
 
-    def __init__(self, name: str, data: np.ndarray=None):
+    # Cluster encoded spectra
+    logger.info("Start clustering")    
+    cluster_labels, representative_masks = cluster_encoded_spectra(
+        spectra_by_charge_df=spectra_by_charge_df,
+        encoded_spectra_hv=encoded_spectra_hv,
+        config=config, logger=logger)
 
-        if data is None:
-            self.shm_data = shared_memory.SharedMemory(name=name)
-        else:
-            self.name = name
-            self.nbytes = data.nbytes
-            self.dtype = data.dtype
-            self.shape = data.shape
-
-            try:
-                self.shm_data = shared_memory.SharedMemory(name=self.name, create=True, size=self.nbytes)
-                self.put(data)
-            except FileExistsError:
-                self.shm_data = shared_memory.SharedMemory(name=self.name, create=False, size=self.nbytes)
-                self.put(data)
-            except Exception as shm_e:
-                raise error(shm_e)
-
-    def get_meta(self):
-        return {'name': self.name, 'nbytes': self.nbytes, 'shape': self.shape, 'dtype': self.dtype}
-        
-    def put(self, data: np.ndarray):
-        data_shm = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm_data.buf)
-        data_shm[:] = data[:]
-
-    def gather(self, idx: list = None):
-        if idx is None:
-            arr = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm_data.buf)
-        else:
-            col_size = 1 if len(self.shape)==1 else self.shape[1]
-            shape = list(self.shape)
-            shape[0] = idx[1]-idx[0]
-
-            arr = np.ndarray(
-                shape, dtype=self.dtype, 
-                buffer=self.shm_data.buf[idx[0]*self.dtype.itemsize*col_size: idx[1]*self.dtype.itemsize*col_size])
-        return arr
-
-    def close(self):
-        self.shm_data.close()
-        self.shm_data.unlink()
+    return cluster_labels, representative_masks 
 
 
-def encode_func_shm(
-    slice_idx: tuple,
-    shm_dict: dict,
-    D: int,
-    Q: int,
+
+# TODO
+def encode_cluster_spectra_bucket(
+    spectra_df: pd.DataFrame, 
+    config: Config,
     dim: int,
-    output_type: str
-) -> np.ndarray:
-    lv_hvs = cp.array(shm_dict['lv_hvs'].gather())
-    id_hvs = cp.array(shm_dict['id_hvs'].gather())
+    lv_hvs_packed: cp.array,
+    id_hvs_packed: cp.array,
+    logger: logging,
+    batch_size: int = 5000,
+    output_type: str='numpy'
+)-> List:
+    start = time.time()
 
-    indptr = shm_dict['indptr'].gather([slice_idx[0], slice_idx[1]+1])
+    num_batch = len(spectra_df)//batch_size+1
 
-    shm_idx = [indptr[0], indptr[-1]]
-    data = shm_dict['intensity'].gather(shm_idx)
-    indices = shm_dict['indices'].gather(shm_idx)    
+    lv_hvs = cp.asnumpy(lv_hvs_packed).ravel()
+    id_hvs = cp.asnumpy(id_hvs_packed).ravel()
 
-    batch_size = len(indptr)-1
-    csr_vec = ss.csr_matrix(
-            (data, indices, indptr-indptr[0]), (batch_size, dim), np.float32, False)
+    print('time 1: ', time.time()-start)
+    
+    intensity, mz = _to_csr_vector(
+        spectra_df, config.min_mz, config.fragment_tol)
+    
+    print('time 2: ', time.time()-start)
 
-    return hd_encode_spectra_packed(csr_vec, id_hvs, lv_hvs, batch_size, D, Q, output_type)
+    spectra_df.drop(columns=['mz', 'intensity'], inplace=True)
+
+    print('time 3: ', time.time()-start)
+
+    data_dict = {
+        'lv_hvs': lv_hvs, 'id_hvs': id_hvs, 
+        'intensity': intensity, 'mz': mz}
+
+    encoded_spectra = [encode_func(
+        [i*batch_size, min((i+1)*batch_size, len(spectra_df))], 
+        data_dict, config.hd_dim, config.hd_Q, dim, output_type) for i in tqdm(range(num_batch)) ] 
+                    
+    encoded_spectra = np.concatenate(encoded_spectra, dtype=np.uint32)\
+        if output_type=='numpy' else encoded_spectra
+
+    logger.info("Encode {} spectra in {:.4f}s".format(len(encoded_spectra), time.time()-start))
+
+    return encoded_spectra
+
 
 
 def encode_func(
@@ -372,24 +442,18 @@ def encode_func(
     dim: int,
     output_type: str
 ) -> np.ndarray:
-    indptr = data_dict['indptr'][slice_idx[0]: slice_idx[1]+1]
+    intensity, mz = data_dict['intensity'][slice_idx[0]: slice_idx[1]], data_dict['mz'][slice_idx[0]: slice_idx[1]]
+
+    lv_hvs, id_hvs = cp.array(data_dict['lv_hvs']), cp.array(data_dict['id_hvs'])
+
+    batch_size = slice_idx[1] - slice_idx[0]
     
-    data, indices = data_dict['intensity'][indptr[0]: indptr[-1]], data_dict['indices'][indptr[0]: indptr[-1]]
-
-    batch_size = len(indptr)-1
-    csr_vec = ss.csr_matrix(
-            (data, indices, indptr-indptr[0]), (batch_size, dim), np.float32, False)
-
-    lv_hvs = cp.array(data_dict['lv_hvs'])
-    id_hvs = cp.array(data_dict['id_hvs'])
-
-    return hd_encode_spectra_packed(csr_vec, id_hvs, lv_hvs, batch_size, D, Q, output_type)
-
+    return hd_encode_spectra_packed(intensity, mz, id_hvs, lv_hvs, batch_size, D, Q, output_type)
 
 
 def encode_preprocessed_spectra(
     spectra_df: pd.DataFrame, 
-    config: config,
+    config: Config,
     dim: int,
     lv_hvs_packed: cp.array,
     id_hvs_packed: cp.array,
@@ -397,22 +461,68 @@ def encode_preprocessed_spectra(
     batch_size: int = 5000,
     output_type: str='numpy'
 )-> List:
-    # Create shared memory
     start = time.time()
 
-    num_batch = len(spectra_df)//batch_size+1
+    num_spectra = len(spectra_df)
+    num_batch = num_spectra//batch_size+1
 
     lv_hvs = cp.asnumpy(lv_hvs_packed).ravel()
     id_hvs = cp.asnumpy(id_hvs_packed).ravel()
 
-    intensity, indices, indptr = _to_csr_vector(spectra_df, config.min_mz, config.fragment_tol)
+    print('time 1: ', time.time()-start)
+    
+    intensity, mz = _to_csr_vector(
+        spectra_df, config.min_mz, config.fragment_tol)
+
+    print('time 2: ', time.time()-start)
+
     spectra_df.drop(columns=['mz', 'intensity'], inplace=True)
 
-    data_dict = {'lv_hvs': lv_hvs, 'id_hvs': id_hvs, 'intensity': intensity, 'indices': indices, 'indptr': indptr}
+    print('time 3: ', time.time()-start)
+
+    data_dict = {
+        'lv_hvs': lv_hvs, 'id_hvs': id_hvs, 
+        'intensity': intensity, 'mz': mz}
 
     encoded_spectra = [ encode_func(
-        [i*batch_size, min((i+1)*batch_size, len(spectra_df))], 
+        [i*batch_size, min((i+1)*batch_size, num_spectra)], 
         data_dict, config.hd_dim, config.hd_Q, dim, output_type) for i in tqdm(range(num_batch)) ] 
+                    
+    encoded_spectra = np.concatenate(encoded_spectra, dtype=np.uint32)\
+        if output_type=='numpy' else encoded_spectra
+
+    logger.info("Encode {} spectra in {:.4f}s".format(len(encoded_spectra), time.time()-start))
+
+    return encoded_spectra
+
+
+def encode_spectra(
+    spectra_mz: np.ndarray, 
+    spectra_intensity: np.ndarray, 
+    config: Config,
+    logger: logging,
+    batch_size: int = 5000,
+    output_type: str='numpy'
+)-> np.ndarray:
+    start = time.time()
+
+    # Generate LV-ID hypervectors
+    bin_len, min_mz, max_mz = get_dim(config.min_mz, config.max_mz, config.fragment_tol)
+    
+    lv_hvs, id_hvs = gen_lv_id_hvs(config.hd_dim, config.hd_Q, bin_len, config.hd_id_flip_factor, logger)
+    
+    data_dict = {
+        'lv_hvs': cp.asnumpy(lv_hvs).ravel(), 
+        'id_hvs': cp.asnumpy(id_hvs).ravel(), 
+        'intensity': spectra_intensity, 'mz': spectra_mz}
+
+    num_spectra = spectra_mz.shape[0]
+    num_batch = num_spectra//batch_size+1
+
+    # Encode spectra on GPU
+    encoded_spectra = [ encode_func(
+        [i*batch_size, min((i+1)*batch_size, num_spectra)], 
+        data_dict, config.hd_dim, config.hd_Q, bin_len, output_type) for i in tqdm(range(num_batch)) ] 
                     
     encoded_spectra = np.concatenate(encoded_spectra, dtype=np.uint32)\
         if output_type=='numpy' else encoded_spectra
@@ -438,8 +548,7 @@ def _get_bucket_idx_list(
         bucket_idx_arr[i, :] = [bucket_idx_i[0], bucket_idx_i[-1]]
         bucket_size_arr[i] = bucket_idx_i[-1]-bucket_idx_i[0]+1
     
-    hist, bins = np.histogram(
-        bucket_size_arr, bins=[0, 300, 1000, 5000, 10000, 20000, 30000], density=False)
+    hist, bins = np.histogram(bucket_size_arr, bins=[0, 300, 1000, 5000, 10000, 20000, 30000], density=False)
 
     logger.info("There are {} buckets. Maximum bucket size = {}".format(num_bucket, max(bucket_size_arr)))
     logger.info("Bucket size distribution:")
@@ -469,183 +578,312 @@ def schedule_bucket(
 def cluster_bucket(
     bucket_slice: tuple, 
     data_dict: dict, 
-    prec_tol: float, 
+    config: Config,
     cluster_func: Callable,
     output_type: str='numpy'
 ):
     if bucket_slice[1]-bucket_slice[0]==0:
-        return np.array([-1])
+        return [np.array([-1]), np.array([True])]
     else:
         bucket_slice[1] += 1
         bucket_hv = data_dict['hv'][bucket_slice[0]: bucket_slice[1]]
         bucket_prec_mz = data_dict['prec_mz'][bucket_slice[0]: bucket_slice[1]]
-
-        pw_dist = fast_nb_cosine_dist_mask(bucket_hv, bucket_prec_mz, prec_tol, output_type)
+        bucket_rt_time = data_dict['rt_time'][bucket_slice[0]: bucket_slice[1]]
+        
+        pw_dist = fast_nb_cosine_dist_mask(bucket_hv, bucket_prec_mz, config.precursor_tol[0], output_type)
         cluster_func.fit(pw_dist) #
-        L = cluster_func.labels_
-        del pw_dist
+        
+        cluster_labels_refined = refine_cluster(
+            bucket_cluster_label = cluster_func.labels_, 
+            bucket_precursor_mzs = bucket_prec_mz,
+            bucket_rts = bucket_rt_time,
+            precursor_tol_mass = config.precursor_tol[0], 
+            precursor_tol_mode = config.precursor_tol[1], 
+            rt_tol = config.rt_tol)
+        
+        representative_mask = get_cluster_representative(
+            cluster_labels=cluster_labels_refined, pw_dist=pw_dist)
 
-        return L
+        return [cluster_labels_refined, representative_mask]
 
 
-def cluster_encoded_spectra(
+def hcluster_bucket(
+    bucket_slice: tuple, 
+    data_dict: dict, 
+    linkage: str,
+    config: Config,
+    output_type: str='numpy'
+):
+    if bucket_slice[1]-bucket_slice[0]==0:
+        return [np.array([-1]), np.array([True], dtype=np.bool)]
+    else:
+        bucket_slice[1] += 1
+        bucket_hv = data_dict['hv'][bucket_slice[0]: bucket_slice[1]]
+        bucket_prec_mz = data_dict['prec_mz'][bucket_slice[0]: bucket_slice[1]]
+        bucket_rt_time = data_dict['rt_time'][bucket_slice[0]: bucket_slice[1]]
+
+        # s = time.time()
+        pw_dist = fast_nb_cosine_dist_condense(bucket_hv, bucket_prec_mz, config.precursor_tol[0], output_type)
+        # pw_dist = squareform(pw_dist).astype(np.float32)
+        # e = time.time()
+        # print("Time pw_dist: ", e-s)
+        
+        # s = time.time()
+        lk = fastcluster.linkage(pw_dist, linkage)
+        # e = time.time()
+        # print("Time linkage: ", e-s)
+
+        # s = time.time()
+        L = fcluster(lk, config.eps, 'distance') - 1
+        # e = time.time()
+        # print("Time cluster: ", e-s)
+        
+        cluster_labels_refined = refine_cluster(
+            bucket_cluster_label = L, 
+            bucket_precursor_mzs = bucket_prec_mz,
+            bucket_rts = bucket_rt_time,
+            precursor_tol_mass = config.precursor_tol[0], 
+            precursor_tol_mode = config.precursor_tol[1], 
+            rt_tol = config.rt_tol)
+        
+        pw_dist = squareform(pw_dist).astype(np.float32)
+        representative_mask = get_cluster_representative(
+            cluster_labels=cluster_labels_refined, pw_dist=pw_dist)
+        
+        return [cluster_labels_refined, representative_mask]
+ 
+
+def hcluster_par_bucket(
+    bucket_slice: tuple, 
+    bucket_hv: np.ndarray,
+    bucket_prec_mz: np.ndarray,
+    bucket_rt_time: np.ndarray,
+    linkage: str,
+    precursor_tol: list,
+    eps: float,
+    rt_tol: float,
+    output_type: str='numpy'
+):
+    if bucket_slice[1]-bucket_slice[0]==0:
+        return [np.array([-1]), np.array([True], dtype=np.bool)]
+    else:
+        pw_dist = fast_nb_cosine_dist_condense(bucket_hv, bucket_prec_mz, precursor_tol[0], output_type)
+
+        lk = fastcluster.linkage(pw_dist, linkage)
+
+        L = fcluster(lk, eps, 'distance') - 1
+
+        cluster_labels_refined = refine_cluster(
+            bucket_cluster_label = L, 
+            bucket_precursor_mzs = bucket_prec_mz,
+            bucket_rts = bucket_rt_time,
+            precursor_tol_mass = precursor_tol[0], 
+            precursor_tol_mode = precursor_tol[1], 
+            rt_tol = rt_tol)
+                
+        pw_dist = squareform(pw_dist).astype(np.float32)
+        representative_mask = get_cluster_representative(
+            cluster_labels=cluster_labels_refined, pw_dist=pw_dist)
+        
+        return [cluster_labels_refined, representative_mask]
+    
+
+
+def cluster_spectra(
     spectra_by_charge_df: pd.DataFrame,
-    encoded_spectra_hv: np.array,
-    config: config,
+    encoded_spectra_hv: np.ndarray,
+    config: Config,
     logger: logging
 ):
     # Save data to shared memory
     start = time.time()
-    prec_mz = np.vstack(spectra_by_charge_df.precursor_mz).astype(np.float32)
-    data_dict = {'hv': encoded_spectra_hv, 'prec_mz': prec_mz}
-
+    
+    data_dict = {
+        'hv': encoded_spectra_hv, 
+        'prec_mz': np.vstack(spectra_by_charge_df.precursor_mz).astype(np.float32),
+        'rt_time': np.vstack(spectra_by_charge_df.retention_time).astype(np.float32)}
+    
     ## Start clustering in GPU or CPU ##
     bucket_idx_dict = schedule_bucket(spectra_by_charge_df, logger)
-    if config.use_gpu_cluster:
-        # DBSCAN clustering on GPU
-        dbscan_cluster_func = cuml.DBSCAN(
-            eps=config.eps, min_samples=2, metric='precomputed',
-            calc_core_sample_indices=False, output_type='numpy')
-        cluster_device = 'GPU'
+    
+    cluster_device = 'CPU'
+    if config.cluster_alg == 'dbscan':
+        if config.use_gpu_cluster:
+            # DBSCAN clustering on GPU
+            cluster_func = cuml.DBSCAN(
+                eps=config.eps, min_samples=2, metric='precomputed',
+                calc_core_sample_indices=False, output_type='numpy')
+
+            cluster_device = 'GPU'
+        else:
+            # DBSCAN clustering on CPU
+            cluster_func = DBSCAN(eps=config.eps, min_samples=2, metric='precomputed', n_jobs=config.cpu_core_cluster)
+
+        cluster_results = [cluster_bucket(
+            bucket_slice = b_slice_i, 
+            data_dict = data_dict,
+            config = config,
+            cluster_func = cluster_func,
+            output_type = 'cupy' if config.use_gpu_cluster else 'numpy') 
+            for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr'])]
+        
+    elif config.cluster_alg in ['hc_single', 'hc_complete', 'hc_average']:
+        with Parallel(n_jobs=config.cpu_core_cluster) as parallel:
+            cluster_results = parallel(delayed(hcluster_par_bucket)(
+                b_slice_i, 
+                data_dict['hv'][b_slice_i[0]: b_slice_i[1]+1],
+                data_dict['prec_mz'][b_slice_i[0]: b_slice_i[1]+1],
+                data_dict['rt_time'][b_slice_i[0]: b_slice_i[1]+1],
+                config.cluster_alg[3:], config.precursor_tol, config.eps, config.rt_tol, 'numpy')
+                    for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr']))
+                   
+        # cluster_results = [hcluster_bucket(
+        #     bucket_slice=b_slice_i, 
+        #     data_dict=data_dict,
+        #     linkage=config.cluster_alg[3:],
+        #     config=config, 
+        #     output_type='numpy') 
+        #     for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr'])]
+        
     else:
-        # DBSCAN clustering on CPU
-        dbscan_cluster_func = DBSCAN(eps=config.eps, min_samples=2, metric='precomputed', n_jobs=config.cpu_core_cluster)
-        cluster_device = 'CPU'
-   
-
-    cluster_labels = [cluster_bucket(
-        bucket_slice=b_slice_i, 
-        data_dict=data_dict,
-        prec_tol=config.precursor_tol[0], 
-        cluster_func=dbscan_cluster_func,
-        output_type='cupy' if config.use_gpu_cluster else 'numpy') 
-        for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr'])]
-
-    cluster_labels = [cluster_labels[i] for i in bucket_idx_dict['reorder_idx']]
-
+        raise Exception("Error clustering algorithm: " + config.cluster_alg)
+ 
+ 
+    # Re-order cluster results
+    cluster_results = [cluster_results[i] for i in bucket_idx_dict['reorder_idx']]
+    
+    cluster_labels = [res_i[0] for res_i in cluster_results]
+    cluster_labels = assign_unique_cluster_labels(cluster_labels)
+    cluster_labels = np.hstack(cluster_labels)
+        
+    representative_mask = np.hstack([res_i[1] for res_i in cluster_results])
+    
     logger.info("{} clustering in {:.4f} s".format(cluster_device, time.time()-start))
 
-    return cluster_labels
+    return cluster_labels, representative_mask
 
 
-def encode_cluster_spectra(
+    
+def cluster_encoded_spectra(
     spectra_by_charge_df: pd.DataFrame,
-    config: config,
-    logger: logging,
-    bin_len: int,
-    lv_hvs: cp.array,
-    id_hvs: cp.array
+    encoded_spectra_hv: np.array,
+    config: Config,
+    logger: logging
 ):
-    # Encode spectra
-    logger.info("Start encoding")
-    encoded_spectra_hv = encode_preprocessed_spectra(
-            spectra_df=spectra_by_charge_df, 
-            config=config, dim=bin_len, logger=logger,
-            lv_hvs_packed=lv_hvs, id_hvs_packed=id_hvs,
-            output_type='numpy')
+    # Save data to shared memory
+    start = time.time()
+    
+    data_dict = {
+        'hv': encoded_spectra_hv, 
+        'prec_mz': np.vstack(spectra_by_charge_df.precursor_mz).astype(np.float32),
+        'rt_time': np.vstack(spectra_by_charge_df.retention_time).astype(np.float32)
+        }
+    
+    ## Start clustering in GPU or CPU ##
+    bucket_idx_dict = schedule_bucket(spectra_by_charge_df, logger)
 
-    # Cluster encoded spectra
-    logger.info("Start clustering")    
-    cluster_labels = cluster_encoded_spectra(
-        spectra_by_charge_df=spectra_by_charge_df,
-        encoded_spectra_hv=encoded_spectra_hv,
-        config=config, logger=logger)
+    cluster_device = 'CPU'
+    if config.cluster_alg == 'dbscan':
+        if config.use_gpu_cluster:
+            # DBSCAN clustering on GPU
+            cluster_func = cuml.DBSCAN(
+                eps=config.eps, min_samples=2, metric='precomputed',
+                calc_core_sample_indices=False, output_type='numpy')
 
-    return cluster_labels
+            cluster_device = 'GPU'
+        else:
+            # DBSCAN clustering on CPU
+            cluster_func = DBSCAN(eps=config.eps, min_samples=2, metric='precomputed', n_jobs=config.cpu_core_cluster)
 
-
-def encode_cluster_bucket_shm(
-    bucket_slice: tuple, 
-    shm_dict: dict,
-    D: int,
-    Q: int,
-    prec_tol: float,
-    bin_len: int,
-    cluster_func: Callable,
-    output_type: str='numpy'
-):
-    if bucket_slice[1]-bucket_slice[0]==0:
-        return np.array([-1])
-    else:
-        bucket_slice[1] += 1
-        bucket_hv = encode_func_shm(
-            slice_idx=bucket_slice,
-            shm_dict=shm_dict,
-            D=D, Q=Q,
-            dim=bin_len,
-            output_type=output_type)
-
-        bucket_prec_mz = shm_dict['shm_prec_mz'].gather(bucket_slice)
-
-        # start = time.time()
-        pw_dist = fast_nb_cosine_dist_mask(
-            bucket_hv, bucket_prec_mz, prec_tol, output_type)
-
-        cluster_func.fit(pw_dist) #
-        L = cluster_func.labels_
-        del pw_dist, bucket_hv
+        cluster_results = [cluster_bucket(
+            bucket_slice = b_slice_i, 
+            data_dict = data_dict,
+            config = config,
+            cluster_func = cluster_func,
+            output_type = 'cupy' if config.use_gpu_cluster else 'numpy') 
+            for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr'])]
         
-        return L
+    elif config.cluster_alg in ['hc_single', 'hc_complete', 'hc_average']:
+        with Parallel(n_jobs=config.cpu_core_cluster) as parallel:
+            cluster_results = parallel(delayed(hcluster_par_bucket)(
+                b_slice_i, 
+                data_dict['hv'][b_slice_i[0]: b_slice_i[1]+1],
+                data_dict['prec_mz'][b_slice_i[0]: b_slice_i[1]+1],
+                data_dict['rt_time'][b_slice_i[0]: b_slice_i[1]+1],
+                config.cluster_alg[3:], config.precursor_tol, config.eps, config.rt_tol, 'numpy')
+                    for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr']))
+                
+        # raise Exception("Un-updated clustering functions: " + config.cluster_alg)
+   
+        # cluster_results = [hcluster_bucket(
+        #     bucket_slice=b_slice_i, 
+        #     data_dict=data_dict,
+        #     linkage=config.cluster_alg[3:],
+        #     config=config, 
+        #     output_type='numpy') 
+        #     for b_slice_i in tqdm(bucket_idx_dict['sort_bucket_idx_arr'])]
+        
+    else:
+        raise Exception("Error clustering algorithm: " + config.cluster_alg)
+ 
+    # Re-order cluster results
+    cluster_results = [cluster_results[i] for i in bucket_idx_dict['reorder_idx']]
+
+    cluster_labels = [res_i[0] for res_i in cluster_results]
+    cluster_labels = assign_unique_cluster_labels(cluster_labels)
+    cluster_labels = np.hstack(cluster_labels)
+        
+    representative_mask = np.hstack([res_i[1] for res_i in cluster_results])
+    
+    logger.info("{} clustering in {:.4f} s".format(cluster_device, time.time()-start))
+
+    return cluster_labels, representative_mask
 
 
-def post_process_cluster(
-    spectra_df, 
-    bucket_cluster_labels, 
-    if_refine, 
+def refine_cluster(
+    bucket_cluster_label, 
+    bucket_precursor_mzs, 
+    bucket_rts,
     precursor_tol_mass, 
     precursor_tol_mode, 
     rt_tol, 
-    min_samples,
-    logger
-    ):
+    min_samples =2):
     '''
-        Re-order and assign unique cluster labels
+        Refine initial clusters to make sure spectra within a cluster don't 
+        have an excessive precursor m/z difference.
     '''
-    init_unique_cluster_num = sum([np.amax(l_i)+1 for l_i in bucket_cluster_labels])
-    
-    logger.info('Finetune %d initial unique non-singleton clusters to not'
-                ' exceed %.2f %s precursor m/z tolerance%s',
-                init_unique_cluster_num, precursor_tol_mass, precursor_tol_mode,
-                f' and {rt_tol} retention time tolerance' if rt_tol is not None else '')
+    # Cluster refinement step
+    bucket_cluster_label = bucket_cluster_label.flatten()
+    order = np.argsort(bucket_cluster_label)
+    reverse_order = np.argsort(order)
+    sorted_cluster_label = bucket_cluster_label[order]
 
-    reorder_labels = []
-    label_base, cluster_idx_start = 0, 0
-    ft_unique_cluster_num, ft_noise_cluster_num = 0, 0
+    sorted_bucket_precursor_mzs, sorted_bucket_rts =  bucket_precursor_mzs[order].flatten(), bucket_rts[order].flatten()
+
+    if sorted_cluster_label[-1] == -1: # Only noise samples.
+        n_clusters, n_noise = 0, len(sorted_cluster_label)
+    else:
+        group_idx = nb.typed.List(_get_cluster_group_idx(sorted_cluster_label))
+        n_clusters = nb.typed.List(
+            [_postprocess_cluster(
+                sorted_cluster_label[start_i:stop_i], 
+                sorted_bucket_precursor_mzs[start_i:stop_i], 
+                sorted_bucket_rts[start_i:stop_i], 
+                precursor_tol_mass, precursor_tol_mode, rt_tol, min_samples)
+                for start_i, stop_i in group_idx])
+
+        _assign_unique_cluster_labels(sorted_cluster_label, group_idx, n_clusters, min_samples)
+        
+    return sorted_cluster_label[reverse_order]
+
+
+def assign_unique_cluster_labels(bucket_cluster_labels):
+    '''
+        Re-order and assign unique cluster labels for spectra from different charges
+    '''
+    reorder_labels, label_base = [], 0
     for idx_i, cluster_i in enumerate(bucket_cluster_labels):
-        # print(cluster_i)
         cluster_i = cluster_i.flatten()
-
-        # Cluster refinement step
-        if if_refine:
-            # Refine initial clusters to make sure spectra within a cluster don't
-            # have an excessive precursor m/z difference.
-            order = np.argsort(cluster_i)
-            reverse_order = np.argsort(order)
-            sorted_cluster_i = cluster_i[order]
-
-            precursor_mzs_i, rts_i = np.hsplit(spectra_df.iloc[cluster_idx_start: cluster_idx_start+len(cluster_i)][['precursor_mz', 'retention_time']].to_numpy()[order, :], 2)
-            precursor_mzs_i, rts_i = precursor_mzs_i.flatten(), rts_i.flatten()
-            cluster_idx_start += len(cluster_i)
-
-            if sorted_cluster_i[-1] == -1:     # Only noise samples.
-                n_clusters, n_noise = 0, len(sorted_cluster_i)
-            else:
-                group_idx = nb.typed.List(_get_cluster_group_idx(sorted_cluster_i))
-                n_clusters = nb.typed.List(
-                    [_postprocess_cluster(
-                        sorted_cluster_i[start_i:stop_i], 
-                        precursor_mzs_i[start_i:stop_i], 
-                        rts_i[start_i:stop_i], 
-                        precursor_tol_mass, precursor_tol_mode, rt_tol, min_samples)
-                        for start_i, stop_i in group_idx])
-
-                _assign_unique_cluster_labels(sorted_cluster_i, group_idx, n_clusters, min_samples)
-
-                cluster_i[:] = sorted_cluster_i[reverse_order]
-                n_clusters, n_noise = np.amax(cluster_i) + 1, np.sum(cluster_i==-1)
-
-            ft_unique_cluster_num += n_clusters
-            ft_noise_cluster_num += n_noise
                 
         # Re-order and assign unique cluster labels
         noise_idx = cluster_i == -1
@@ -656,13 +894,7 @@ def post_process_cluster(
         label_base += (num_clusters+num_noises)
 
         reorder_labels.append(cluster_i)
-
-    reorder_labels = np.hstack(reorder_labels)
-
-    logger.info('%d unique non-singleton clusters after precursor m/z '
-                'finetuning, %d total clusters',
-                ft_unique_cluster_num, ft_unique_cluster_num + ft_noise_cluster_num)
-
+    
     return reorder_labels
 
 
@@ -818,10 +1050,11 @@ def _linkage(
 
 
 @nb.njit(cache=True)
-def _assign_unique_cluster_labels(cluster_labels: np.ndarray,
-                                  group_idx: nb.typed.List,
-                                  n_clusters: nb.typed.List,
-                                  min_samples: int) -> None:
+def _assign_unique_cluster_labels(
+    cluster_labels: np.ndarray,
+    group_idx: nb.typed.List,
+    n_clusters: nb.typed.List,
+    min_samples: int) -> None:
     """
     Make sure all cluster labels are unique after potential splitting of
     clusters to avoid excessive precursor m/z differences.
@@ -845,4 +1078,44 @@ def _assign_unique_cluster_labels(cluster_labels: np.ndarray,
             current_label += n_cluster
         else:
             cluster_labels[start_i:stop_i] = -1
+        
+        # print(cluster_labels[start_i:stop_i])
 
+
+# @nb.njit(cache=True, parallel=True)
+def get_cluster_representative(
+    cluster_labels: np.ndarray,
+    pw_dist: np.ndarray
+    ) -> np.ndarray:
+    """
+    Get indexes of the cluster representative spectra (medoids).
+    Parameters
+    ----------
+    clusters : np.ndarray
+        Cluster label assignments.
+    pw_dist : np.ndarray
+        The condense pairwise distance matrix with shape Nx(N-1)x2.
+    Returns
+    -------
+    np.ndarray
+        The mask of the medoid elements for all clusters.
+    """
+    # Find the indexes of the representatives for each unique cluster.
+    # noinspection PyUnresolvedReferences
+    clusters = np.unique(cluster_labels)
+    representative_mask = np.zeros(len(cluster_labels), np.bool)
+    for i, cluster_i in enumerate(clusters):
+        cluster_idx = np.flatnonzero(cluster_labels == cluster_i)
+        
+        if cluster_i == -1: # noise
+            representative_mask[cluster_idx] = True
+        else:
+            if len(cluster_idx) <= 2: # identical pw_dist
+                representative_mask[cluster_idx[0]] = True
+            else:
+                representative_mask[int(np.argmin(pw_dist[cluster_idx, :].mean(axis=1)))] = True
+
+                # TODO: Support for condense distance matrix
+                
+        
+    return representative_mask

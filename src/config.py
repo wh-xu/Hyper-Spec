@@ -45,29 +45,32 @@ class Config:
             'output_filename', type=str, 
             help='Output file name.')
         self._parser.add_argument(
+            '--checkpoint', type=str, default=None,
+            help='Checkpoint name of spectra meta and HV (default: %(default)s).')
+        self._parser.add_argument(
             '--file_type', default='mgf',
             choices=['mgf'],
             help='Spectra file type (default: %(default)s).')
 
         # self._parser.add_argument(
-            # '--work_dir', default=None,
+            # '--work_dir', default=None, type=str,
             # help='Working directory (default: temporary directory).')
         # self._parser.add_argument(
             # '--overwrite', action='store_true',
             # help="Overwrite existing results (default: don't overwrite).")
-        # self._parser.add_argument(
-            # '--export_representatives', action='store_true',
-            # help='Export cluster representatives to an MGF file '
-                #  '(default: no export).')
+        self._parser.add_argument(
+            '--representative_mgf', action='store_true',
+            help='Export cluster representatives to an MGF file '
+                 '(default: %(default)s).')
 
         # SYSTEM
         self._parser.add_argument(
-            '--cpu_core_preprocess', default=6, type=int,
-            help='Enabled CPU cores for parallel processing'
+            '--cpu_core_preprocess', default=8, type=int,
+            help='Enabled CPU cores for spectra preprocessing'
                  '(default: %(default)s).')
         self._parser.add_argument(
-            '--cpu_core_cluster', default=6, type=int,
-            help='Enabled CPU cores for CPU clustering step'
+            '--cpu_core_cluster', default=8, type=int,
+            help='Enabled CPU cores for clustering'
                  '(default: %(default)s).')
         self._parser.add_argument(
             '--batch_size', default=5000, type=int,
@@ -75,7 +78,7 @@ class Config:
                  '(default: %(default)s).')
         self._parser.add_argument(
             '--use_gpu_cluster', action='store_true',
-            help='If use GPU\' DBSCAN clustering (default: %(default)s).')
+            help='Use GPU\' DBSCAN clustering (default: %(default)s).')
         
 
         # PREPROCESSING
@@ -129,7 +132,7 @@ class Config:
             help='Flip factor to generate ID HVs (default: %(default)s).')
 
         self._parser.add_argument(
-            '--cluster_charges', nargs="+", type=int, default=[2],
+            '--cluster_charges', nargs="+", type=int, default=[],
             help='Charges to cluster (%(default)s)')
         self._parser.add_argument(
             '--precursor_tol', nargs=2, default=[20, 'ppm'],
@@ -144,13 +147,15 @@ class Config:
             help='Fragment mass tolerance in m/z (default: %(default)s m/z).')
 
         self._parser.add_argument(
+            '--cluster_alg', default='hc_complete', type=str,
+            choices=['dbscan', 'hc_single', 'hc_complete', 'hc_average'],
+            help='Clustering algorithm (default: %(default)s).')
+
+        self._parser.add_argument(
             '--eps', type=float, default=0.6,
             help='The eps parameter (Hamming distance) for DBSCAN clustering '
                  '(default: %(default)s). Relevant Hamming distance thresholds '
                  'are typically around 0.6.')
-        self._parser.add_argument(
-            '--refine', action='store_true',
-            help='If use post clustering refinement')
 
         # Filled in 'parse', contains the specified settings.
         self._namespace = None

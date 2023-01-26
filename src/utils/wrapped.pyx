@@ -3,7 +3,7 @@ import bottleneck as bn
 import sys, time
 
 cimport cython
-from libc.stdio cimport FILE, fopen, scanf, getline, fclose, printf
+from libc.stdio cimport FILE, fopen, scanf, getline, fclose, printf, fprintf
 from libc.stdlib cimport free, atof, atoi, strtof
 from libc.string cimport strcmp, strlen
 
@@ -82,6 +82,7 @@ cdef inline bint is_charge(char *buf):
     # return fast_str_compare(buf, 'CHARGE', 6)==0
     return strcmp(buf[0:6], 'CHARGE')==0
 
+
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cpdef list load_mgf_file(filename):
@@ -112,11 +113,6 @@ cpdef list load_mgf_file(filename):
     if(fp==NULL):
         print("File open failed!")
         sys.exit(0)
-
-    # cdef:
-        # char* test_str = "3.2 4.5"
-    # peak_i = fast_parse(test_str, test_str+7, &mz_temp, &intensity_temp)
-    # printf("parsing %d data\n", peak_i)
 
     cdef:
         double file_load_time = .0
@@ -226,3 +222,47 @@ cpdef list load_mgf_file(filename):
         # time.time()-total_start))
 
     return read_spectra_list
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef void export_mgf_file(list spectra_list, filename):
+    cdef:
+        FILE *fp
+        bytes title
+        int charge, scans, cluster
+        float tmp
+        spec_data_fmt mz_temp, intensity_temp
+
+    fp = fopen(filename.encode(), "w")
+
+    if(fp==NULL):
+        print("File open failed!")
+        sys.exit(0)
+
+    for spec_i in spectra_list:
+        fprintf(fp, "BEGIN IONS\n")
+        title = spec_i[2].encode()
+        fprintf(fp, "TITLE=%s\n", title)
+
+        tmp = spec_i[1]
+        fprintf(fp, "PEPMASS=%f\n", tmp)
+
+        tmp = spec_i[4]
+        fprintf(fp, "RTINSECONDS=%f\n", tmp)
+
+        charge = spec_i[0]
+        fprintf(fp, "CHARGE=%d+\n", charge)
+
+        cluster = spec_i[7]
+        fprintf(fp, "CLUSTER=%d\n", cluster)
+
+        # mz and intensity pairs
+        for j in range(spec_i[5].shape[0]):
+            mz_temp, intensity_temp = spec_i[5][j], spec_i[6][j]
+            fprintf(fp, "%.5f %.1f\n", mz_temp, intensity_temp)
+
+        fprintf(fp, "END IONS\n")
+
+    fclose(fp)
+    

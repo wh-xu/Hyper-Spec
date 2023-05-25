@@ -1,3 +1,6 @@
+[![License bsd-3-clause](https://badgen.net/badge/license/BSD-3/red)](https://github.com/wh-xu/Hyper-Spec/blob/main/LICENSE)
+[![JPR](https://img.shields.io/badge/JPR-2023-informational)](https://pubs.acs.org/doi/full/10.1021/acs.jproteome.2c00612)
+
 HyperSpec: Ultra-fast Mass Spectra Clustering in Hyperdimensional Space
 =======================================================
 
@@ -110,6 +113,12 @@ How HyperSpec Works
 1. _HyperSpec_ first encodes the processed spectra into binary hypervector (HV) with ultra-high dimension (>1000) based on level-id encoding method. The encoding module is implemented and optimized for GPU for shorter runtime.
 2. The entire dataset is divided into small buckets and the pairwise Hamming distance matrix for each bucket is computed. _HyperSpec_ implements very efficient Hamming distance computation kernels on GPU.
 3. _HyperSpec_ finally clusters each spectra bucket using DBSCAN algorithm. Thanks HD computing's lightweight computation and powerful data presentation capability, _HyperSpec_ achieves significant speedup over other spectra clustering tools. Most of spectra datasets can be clustered within a few minutes.
+
+
+Publication
+------------------------------------------------------
+1. Xu, Weihong, Jaeyoung Kang, Wout Bittremieux, Niema Moshiri, and Tajana Rosing. "HyperSpec: Ultrafast Mass Spectra Clustering in Hyperdimensional Space." [Journal of Proteome Research (2023)](https://pubs.acs.org/doi/full/10.1021/acs.jproteome.2c00612).
+
 
 Contact
 ------------------------------------------------------

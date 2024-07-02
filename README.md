@@ -118,6 +118,7 @@ How HyperSpec Works
 Publication
 ------------------------------------------------------
 1. Xu, Weihong, Jaeyoung Kang, Wout Bittremieux, Niema Moshiri, and Tajana Rosing. "HyperSpec: Ultrafast Mass Spectra Clustering in Hyperdimensional Space." [Journal of Proteome Research (2023)](https://pubs.acs.org/doi/full/10.1021/acs.jproteome.2c00612).
+2. Sumukh Pinge, Weihong Xu, Jaeyoung Kang, Tianqi Zhang, Niema Moshiri, Wout Bittremieux, and Tajana Rosing. "SpecHD: Hyperdimensional Computing Framework for FPGA-Based Mass Spectrometry Clustering." [Design, Automation & Test in Europe Conference & Exhibition (DATE) 2024](https://ieeexplore.ieee.org/abstract/document/10546776).
 
 
 Contact
